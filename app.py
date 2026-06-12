@@ -12,22 +12,6 @@ load_dotenv()
 # Define qual versão da IA vamos usar. O modelo "flash" é rápido e ideal para chatbots.
 MODELO = "gemini-3.1-flash-lite"
 
-# Aqui definimos o "Prompt de Sistema". É a personalidade e as regras que o bot deve seguir.
-instrucoes = """
-Role: Você é um assistente virtual divertido que se comunica EXCLUSIVAMENTE utilizando a "Língua do P".
-Regras de Comunicação:
-1. Absolutamente TODAS as palavras da sua resposta devem seguir a regra da Língua do P. 
-2. Antes de cada sílaba de uma palavra, você deve adicionar a letra "P" seguida da vogal correspondente àquela sílaba.
-   * Exemplo: "Olá" se torna "Popó-plpá" (ou "P-o-p-lá").
-   * Exemplo simples: "Casa" se torna "Paca-pasa".
-   * Exemplo clássico: Adicionar o prefixo "P" antes de cada sílaba: "Tudo bem" -> "Putu-pudo-pbe-pem".
-Diretrizes de Comportamento:
-- Nunca saia do personagem. Mesmo que o usuário peça para você falar normalmente ou diga que não está entendendo, você deve responder na Língua do P explicando que essa é a sua única forma de comunicação.
-- Mantenha as respostas curtas e objetivas para que a leitura não fique excessivamente cansativa para o usuário.
-- Preserve a pontuação e os emojis para manter a comunicação expressiva.
-Se você entendeu, responda à primeira mensagem do usuário imediatamente usando a Língua do P.
-"""
-
 # Inicializa a conexão com a inteligência artificial do Google usando a chave da API
 client = genai.Client(api_key=os.getenv("GENAI_KEY"))
 
@@ -43,15 +27,18 @@ app.secret_key = "ch@tb07"
 # consiga se conectar com esse back-end, mesmo que estejam em arquivos ou portas diferentes.
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Dicionário que funciona como a "memória temporária" do servidor. 
-# Ele guarda a conversa de cada aluno separadamente usando um ID único.
+# Dicionários que funcionam como a "memória temporária" do servidor. 
+# Guardam o chat e a persona ativa de cada aluno separadamente usando um ID único.
 active_chats = {}
+active_personas = {}
 
-def get_user_chat():
+def get_user_chat(persona=None):
     """
     Função principal de gerenciamento de usuários.
     Ela verifica quem está mandando a mensagem e recupera a conversa correta,
     garantindo que o bot não misture o chat do Aluno A com o do Aluno B.
+    Se a persona for informada e for diferente da persona atual da sessão,
+    recria o chat com a nova instrução de sistema.
     """
     
     # Passo 1: Se o usuário é novo (não tem um 'session_id'), criamos um ID único para ele.
@@ -62,17 +49,20 @@ def get_user_chat():
 
     session_id = session['session_id']
 
-    # Passo 2: Se o usuário já tem um ID, mas ainda não tem uma conversa aberta com o Gemini...
-    if session_id not in active_chats:
-        print(f"Criando novo chat Gemini para session_id: {session_id}")
+    # Passo 2: Se o usuário não tem uma conversa aberta ou a persona mudou...
+    if session_id not in active_chats or (persona and active_personas.get(session_id) != persona):
+        print(f"Criando ou recriando chat Gemini para session_id: {session_id}")
         try:
-            # ...nós criamos uma nova conversa e passamos as instruções (personalidade).
+            sys_instruction = persona or active_personas.get(session_id) or "Você é um assistente virtual."
+            # ...nós criamos uma nova conversa e passamos as instruções (personalidade do artista).
             chat_session = client.chats.create(
                 model=MODELO,
-                config=types.GenerateContentConfig(system_instruction=instrucoes)
+                config=types.GenerateContentConfig(system_instruction=sys_instruction)
             )
-            # Guardamos essa conversa no nosso dicionário (memória).
+            # Guardamos essa conversa e a persona correspondente na memória
             active_chats[session_id] = chat_session
+            if persona:
+                active_personas[session_id] = persona
             print(f"Novo chat Gemini criado e armazenado para {session_id}")
         except Exception as e:
             app.logger.error(f"Erro ao criar chat Gemini para {session_id}: {e}", exc_info=True)
@@ -83,9 +73,10 @@ def get_user_chat():
     if session_id in active_chats and active_chats[session_id] is None:
         print(f"Recriando chat Gemini para session_id existente (estava None): {session_id}")
         try:
+            sys_instruction = active_personas.get(session_id) or "Você é um assistente virtual."
             chat_session = client.chats.create(
                 model=MODELO,
-                config=types.GenerateContentConfig(system_instruction=instrucoes)
+                config=types.GenerateContentConfig(system_instruction=sys_instruction)
             )
             active_chats[session_id] = chat_session
         except Exception as e:
@@ -117,9 +108,10 @@ def handle_connect():
     print(f"Cliente conectado: {request.sid}")
     
     try:
-        # Tenta criar a pasta do usuário assim que ele entra
-        get_user_chat()
-        user_session_id = session.get('session_id', 'N/A')
+        # Garante a criação do session_id e exibe informações de conexão
+        if 'session_id' not in session:
+            session['session_id'] = str(uuid4())
+        user_session_id = session['session_id']
         print(f"Sessão Flask para {request.sid} usa session_id: {user_session_id}")
         
         # O comando 'emit' serve para enviar um pacote de dados do servidor PARA o front-end.
@@ -145,8 +137,15 @@ def handle_enviar_mensagem(data):
             emit('erro', {"erro": "Mensagem não pode ser vazia."})
             return
 
-        # Puxa o histórico de conversa desse aluno específico
-        user_chat = get_user_chat()
+        # Separa a persona (enviada pelo front-end antes da mensagem) e o texto real do usuário
+        partes = mensagem_usuario.split("\n\nUsuário diz: ", 1)
+        if len(partes) == 2:
+            persona, texto_usuario = partes
+        else:
+            persona, texto_usuario = None, mensagem_usuario
+
+        # Puxa o histórico de conversa desse aluno específico, ajustando à persona do artista
+        user_chat = get_user_chat(persona=persona)
         if user_chat is None:
             emit('erro', {"erro": "Sessão de chat não pôde ser estabelecida."})
             return
@@ -154,8 +153,8 @@ def handle_enviar_mensagem(data):
         # ==========================================
         # COMUNICAÇÃO COM O GOOGLE GEMINI
         # ==========================================
-        # Aqui o nosso servidor repassa a pergunta para a IA do Google...
-        resposta_gemini = user_chat.send_message(mensagem_usuario)
+        # Aqui o nosso servidor repassa a pergunta (apenas o texto digitado) para a IA do Google...
+        resposta_gemini = user_chat.send_message(texto_usuario)
 
         # ... e aqui extraímos apenas o texto da resposta que o Gemini devolveu.
         # (O 'if/else' garante que vamos achar o texto independente de como a API estruturar a resposta)
@@ -173,6 +172,19 @@ def handle_enviar_mensagem(data):
         app.logger.error(f"Erro ao processar 'enviar_mensagem' para {session.get('session_id', request.sid)}: {e}", exc_info=True)
         # Se algo quebrar (ex: falha de internet), avisamos o front-end educadamente.
         emit('erro', {"erro": f"Ocorreu um erro no servidor: {str(e)}"})
+
+
+@socketio.on('limpar_conversa')
+def handle_limpar_conversa():
+    """
+    EVENTO: O Front-end solicitou limpar a conversa.
+    Apagamos o chat_session e a persona para começar do zero na próxima mensagem.
+    """
+    session_id = session.get('session_id')
+    if session_id:
+        active_chats.pop(session_id, None)
+        active_personas.pop(session_id, None)
+        print(f"Conversa limpa no servidor para session_id: {session_id}")
 
 
 @socketio.on('disconnect')
